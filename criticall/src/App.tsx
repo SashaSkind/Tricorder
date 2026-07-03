@@ -32,6 +32,7 @@ interface AnalyzeResult {
   order: { ordering_provider: string; role: string; phone: string; department: string; pager: string };
   detection: Detection; critical: Critical; paged: boolean;
   impression: string; impression_source: string; alert?: Alert; timeline: TLEvent[]; error?: string;
+  sms?: { channel: string; sent: boolean };
 }
 interface AckResult { acknowledged: boolean; ack: TLEvent; turnaround_seconds: number | null; timeline: TLEvent[] }
 
@@ -124,7 +125,11 @@ function Phone({ result, acked, ackTurnaround, onAck, acking }: {
           {a.body}
           <span className="sms-link">↳ view slice {a.key_slice} · tricorder.app/s/{result.accession}</span>
         </div>
-        <div className="sms-time">delivered · just now</div>
+        <div className="sms-time">
+          {result.sms?.channel === 'twilio' && result.sms?.sent
+            ? `delivered via Twilio · to ${a.to_phone}`
+            : 'delivered · in-app demo (add Twilio creds for real SMS)'}
+        </div>
         {acked && (
           <>
             <div className="sms sms-out">ACK — reviewed, neurosurgery paged. Thanks.</div>

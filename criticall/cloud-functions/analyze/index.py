@@ -17,6 +17,7 @@ import os
 import sys
 import traceback
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import quote
 
 _PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT_DIR not in sys.path:
@@ -27,6 +28,7 @@ from _cases import get_case            # noqa: E402
 from _detect import detect_fracture    # noqa: E402
 from _impression import generate_impression  # noqa: E402
 from _audit import record_event, get_timeline  # noqa: E402
+from _sms import send_sms, target_number, sms_configured  # noqa: E402
 
 logger = create_logger("analyze")
 
@@ -41,7 +43,7 @@ def _read_body(rfile, headers) -> dict:
         return {}
 
 
-def run_pipeline(store, study_uid: str) -> dict:
+def run_pipeline(store, study_uid: str, base_url: str = "") -> dict:
     """Pure pipeline -- returns the analyze payload for a study."""
     case = get_case(study_uid)
     if case is None:
@@ -82,25 +84,43 @@ def run_pipeline(store, study_uid: str) -> dict:
     result["impression"] = imp["impression"]
     result["impression_source"] = imp["source"]
 
+    provider = case["order"]["ordering_provider"]
+    # Tap-to-ACK magic link -> closes the loop without any Twilio inbound config.
+    ack_link = ""
+    if base_url:
+        ack_link = f"{base_url}/ack?study={quote(study_uid)}&r={quote(provider)}"
+
+    sms_body = (
+        f"🚨 CRITICAL RESULT (Tricorder)\n{imp['impression']}"
+        + (f"\n\nReply ACK or tap to acknowledge: {ack_link}" if ack_link else "\n\nReply ACK to acknowledge.")
+    )
+
+    # Real outbound SMS if Twilio is configured; else the in-app phone panel shows it.
+    delivery = send_sms(case["order"]["phone"], sms_body)
+
     alert = {
-        "to": case["order"]["ordering_provider"],
-        "to_phone": case["order"]["phone"],
+        "to": provider,
+        "to_phone": target_number(case["order"]["phone"]),
         "level": crit["level"],
         "fracture_type": crit["fracture_type"],
         "confidence": crit["confidence"],
         "key_slice": crit["key_slice"],
         "body": imp["impression"],
+        "ack_link": ack_link,
     }
     result["paged"] = True
     result["alert"] = alert
+    result["sms"] = {"channel": "twilio" if sms_configured() else "in-app", **delivery}
 
     record_event(store, study_uid, {
         "type": "paged",
-        "to": alert["to"],
+        "to": provider,
         "to_phone": alert["to_phone"],
         "level": crit["level"],
         "confidence": crit["confidence"],
         "channel": "sms",
+        "sms_sent": bool(delivery.get("sent")),
+        "sms_sid": delivery.get("sid"),
     })
     result["timeline"] = get_timeline(store, study_uid)
     return result
@@ -121,9 +141,14 @@ class handler(BaseHTTPRequestHandler):
         if not study_uid:
             self._write_json(400, {"error": "'study_uid' is required"})
             return
+        # Derive the public base URL for the tap-to-ACK link from the request.
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or ""
+        proto = self.headers.get("X-Forwarded-Proto") or ("http" if host.startswith("localhost") else "https")
+        base_url = os.getenv("PUBLIC_BASE_URL", "").strip() or (f"{proto}://{host}" if host else "")
+
         try:
             store = self.context.agent.store
-            result = run_pipeline(store, study_uid)
+            result = run_pipeline(store, study_uid, base_url=base_url)
             status = 404 if result.get("error") else 200
             logger.log(f"analyze study={study_uid} paged={result.get('paged')} "
                        f"source={result.get('impression_source')}")
